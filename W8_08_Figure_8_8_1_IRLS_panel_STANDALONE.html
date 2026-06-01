@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Figure 8.8.1. Three families fit by real IRLS</title>
+<style>
+    html, body { margin: 0; padding: 0; background: transparent; }
+    body { font-family: 'Segoe UI', Helvetica, Arial, sans-serif; color: #2d3b45; }
+    .oet-wrap { border: 1px solid #d0d0d0; border-radius: 4px; padding: 12px; background: #ffffff; max-width: 720px; margin: 0 auto; }
+    .oet-row { margin-bottom: 8px; font-size: 14px; }
+    .oet-row label { font-weight: bold; }
+    .oet-row input[type=range] { width: 48%; vertical-align: middle; }
+    .oet-val { font-weight: bold; color: #c8102e; }
+    #oetReadout { font-size: 13px; margin-top: 8px; }
+</style>
+</head>
+<body>
+<div class="oet-wrap">
+    <div class="oet-row">
+        <label for="oetLambda">True variance power (lambda):</label>
+        <input type="range" id="oetLambda" min="0" max="2" step="0.05" value="1" />
+        <span id="oetLambdaVal" class="oet-val">1.00</span>
+    </div>
+    <div class="oet-row">
+        <label for="oetZero">Share of dyads with zero tariff:</label>
+        <input type="range" id="oetZero" min="0" max="0.8" step="0.05" value="0" />
+        <span id="oetZeroVal" class="oet-val">0&#37;</span>
+    </div>
+    <svg id="oetFig" viewBox="0 0 700 380" style="width: 100%; height: auto;"></svg>
+    <div id="oetReadout"></div>
+</div>
+<script>
+(function () {
+    var svg = document.getElementById("oetFig");
+    if (!svg) return;
+    var NS = "http://www.w3.org/2000/svg";
+    var slider = document.getElementById("oetLambda");
+    var lamLabel = document.getElementById("oetLambdaVal");
+    var zeroSlider = document.getElementById("oetZero");
+    var zeroLabel = document.getElementById("oetZeroVal");
+    var readout = document.getElementById("oetReadout");
+
+    // Plot geometry
+    var W = 700, H = 380, padL = 60, padR = 20, padT = 20, padB = 50;
+    var x0 = padL, x1 = W - padR, y0 = H - padB, y1 = padT;
+
+    // True model on the LEVEL scale: E[X | t] = exp(A - THETA*t), t = log(1+tariff).
+    // theta is the trade elasticity (sign suppressed in the display).
+    var THETA_TRUE = 5.0, A = 14.0, N = 32;
+    var Y_LO = 6.0, Y_HI = 15.5, X_HI = 0.65;
+
+    // Fixed design points so the picture is stable across redraws.
+    var xs = [];
+    for (var i = 0; i < N; i++) xs.push(0.02 + 0.60 * (i / (N - 1)));
+
+    // Deterministic pseudo-random generator so the figure is reproducible.
+    var seed = 20260601;
+    function rnd() { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; }
+    function gauss() { var u = rnd(), v = rnd(); return Math.sqrt(-2 * Math.log(u + 1e-9)) * Math.cos(2 * Math.PI * v); }
+
+    function sx(x) { return x0 + (x - 0.0) / X_HI * (x1 - x0); }
+    function sy(y) { return y0 + (y - Y_LO) / (Y_HI - Y_LO) * (y1 - y0); }
+
+    // ---- Real GLM fit by IRLS, log link, two-column design [1, t]. ----
+    // Variance function V(mu) = mu^vpow:  Poisson vpow=1, Gamma vpow=2, Gaussian vpow=0.
+    // Log link: mu = exp(eta), dmu/deta = mu, so IRLS weight w = mu^2 / V(mu) = mu^(2-vpow),
+    // working response z = eta + (y - mu)/mu. We solve weighted normal equations for
+    // [b0, b1] each iteration. Returns theta = -b1. data: array of {t, y}.
+    function glmFitLog(data, vpow) {
+        var b0 = Math.log(Math.max(1, mean(data.map(function (d) { return d.y; })))), b1 = 0;
+        for (var iter = 0; iter < 60; iter++) {
+            var s00 = 0, s01 = 0, s11 = 0, t0 = 0, t1 = 0;
+            for (var i = 0; i < data.length; i++) {
+                var t = data[i].t, y = data[i].y;
+                var eta = b0 + b1 * t;
+                var mu = Math.exp(eta);
+                if (!isFinite(mu) || mu <= 0) { mu = 1e-8; }
+                var w = Math.pow(mu, 2 - vpow);          // IRLS weight for log link
+                var z = eta + (y - mu) / mu;             // working response
+                s00 += w; s01 += w * t; s11 += w * t * t;
+                t0 += w * z; t1 += w * t * z;
+            }
+            var det = s00 * s11 - s01 * s01;
+            if (Math.abs(det) < 1e-12) break;
+            var nb0 = (t0 * s11 - t1 * s01) / det;
+            var nb1 = (s00 * t1 - s01 * t0) / det;
+            var step = Math.abs(nb0 - b0) + Math.abs(nb1 - b1);
+            b0 = nb0; b1 = nb1;
+            if (step < 1e-9) break;
+        }
+        return { b0: b0, b1: b1, theta: -b1 };
+    }
+
+    function mean(a) { var s = 0; for (var i = 0; i < a.length; i++) s += a[i]; return a.length ? s / a.length : 0; }
+
+    // Modified Park: regress log(raw squared residual) on log(fitted mean) from the
+    // genuine Poisson fit. Slope is the estimated variance power lambda.
+    function parkLambda(data, fit) {
+        var n = 0, sx2 = 0, sxy = 0, sxsum = 0, sysum = 0;
+        for (var i = 0; i < data.length; i++) {
+            var muhat = Math.exp(fit.b0 + fit.b1 * data[i].t);
+            var resid = data[i].y - muhat;
+            var r2 = resid * resid;
+            if (r2 <= 0 || muhat <= 0) continue;
+            var lx = Math.log(muhat), ly = Math.log(r2);
+            n++; sxsum += lx; sysum += ly; sx2 += lx * lx; sxy += lx * ly;
+        }
+        if (n < 3) return NaN;
+        var det = n * sx2 - sxsum * sxsum;
+        return det !== 0 ? (n * sxy - sxsum * sysum) / det : NaN;
+    }
+
+    function draw(lambdaTrue, zeroShare) {
+        while (svg.firstChild) svg.removeChild(svg.firstChild);
+        seed = 20260601; // reset so the cloud is stable for given inputs
+
+        // Build the synthetic panel. A fraction zeroShare of dyads are set to a
+        // zero tariff (t = 0); the rest keep their design tariff. The response is
+        // a heteroskedastic draw around the true level mean, sd ~ mu^(lambda/2).
+        var data = [], nZeroTariff = 0;
+        for (var i = 0; i < N; i++) {
+            var isZero = rnd() < zeroShare;
+            var t = isZero ? 0.0 : xs[i];
+            if (isZero) nZeroTariff++;
+            var mu = Math.exp(A - THETA_TRUE * t);
+            var sd = 0.42 * Math.pow(mu, lambdaTrue / 2);
+            var level = mu + sd * gauss();
+            data.push({ t: t, y: level });
+        }
+
+        // Axes
+        function line(xa, ya, xb, yb, col, wdt, dash) {
+            var l = document.createElementNS(NS, "line");
+            l.setAttribute("x1", xa); l.setAttribute("y1", ya);
+            l.setAttribute("x2", xb); l.setAttribute("y2", yb);
+            l.setAttribute("stroke", col); l.setAttribute("stroke-width", wdt);
+            if (dash) l.setAttribute("stroke-dasharray", dash);
+            svg.appendChild(l);
+        }
+        function text(x, y, s, col, size, anchor, weight) {
+            var tn = document.createElementNS(NS, "text");
+            tn.setAttribute("x", x); tn.setAttribute("y", y);
+            tn.setAttribute("fill", col); tn.setAttribute("font-size", size || 12);
+            tn.setAttribute("text-anchor", anchor || "start");
+            if (weight) tn.setAttribute("font-weight", weight);
+            tn.textContent = s; svg.appendChild(tn);
+        }
+        line(x0, y0, x1, y0, "#888", 1);
+        line(x0, y0, x0, y1, "#888", 1);
+        text((x0 + x1) / 2, H - 14, "log(1 + tariff)", "#444", 13, "middle");
+        var yl = document.createElementNS(NS, "text");
+        yl.setAttribute("x", 16); yl.setAttribute("y", (y0 + y1) / 2);
+        yl.setAttribute("fill", "#444"); yl.setAttribute("font-size", 13);
+        yl.setAttribute("text-anchor", "middle");
+        yl.setAttribute("transform", "rotate(-90 16 " + ((y0 + y1) / 2) + ")");
+        yl.textContent = "log trade flow"; svg.appendChild(yl);
+
+        // Data points: plot on log scale for display; zero-tariff points sit on the axis.
+        for (var i = 0; i < data.length; i++) {
+            var yval = data[i].y > 0 ? Math.log(data[i].y) : Y_LO;
+            var isZeroT = data[i].t === 0.0;
+            var c = document.createElementNS(NS, "circle");
+            c.setAttribute("cx", sx(data[i].t)); c.setAttribute("cy", sy(yval));
+            c.setAttribute("r", 4);
+            c.setAttribute("fill", isZeroT ? "#e0a0a8" : "#9aa7b1");
+            c.setAttribute("opacity", isZeroT ? "0.9" : "0.75");
+            svg.appendChild(c);
+        }
+
+        // True line (level mean, shown on log axis as a straight line A - theta*t)
+        line(sx(0.0), sy(A), sx(X_HI), sy(A - THETA_TRUE * X_HI), "#000000", 2, "4 3");
+
+        // Real IRLS fits. Gamma uses positive responses only (its support), matching
+        // the real estimator; record how many it drops.
+        var posData = data.filter(function (d) { return d.y > 0; });
+        var nDropped = data.length - posData.length;
+
+        var fams = [
+            { name: "Gaussian (lambda 0)", vpow: 0, col: "#1f77b4", data: data },
+            { name: "Poisson (lambda 1)", vpow: 1, col: "#2ca02c", data: data },
+            { name: "Gamma (lambda 2)", vpow: 2, col: "#c8102e", data: posData }
+        ];
+        var fits = {};
+        for (var f = 0; f < fams.length; f++) {
+            var fit = glmFitLog(fams[f].data, fams[f].vpow);
+            fits[fams[f].name] = fit;
+            line(sx(0.0), sy(fit.b0), sx(X_HI), sy(fit.b0 + fit.b1 * X_HI), fams[f].col, 2);
+        }
+
+        // Legend
+        var lx = x1 - 185, ly0 = y1 + 6;
+        text(lx, ly0, "True theta = 5.0", "#000", 12, "start", "bold");
+        line(lx, ly0 + 9, lx + 22, ly0 + 9, "#000", 2, "4 3");
+        text(lx + 28, ly0 + 13, "true mean", "#000", 11);
+        for (var f = 0; f < fams.length; f++) {
+            var yy = ly0 + 24 + f * 16;
+            line(lx, yy + 4, lx + 22, yy + 4, fams[f].col, 2);
+            var th = fits[fams[f].name].theta;
+            text(lx + 28, yy + 8, fams[f].name + ": theta " + (isFinite(th) ? th.toFixed(2) : "n/a"), fams[f].col, 11);
+        }
+
+        // Modified Park lambda from the genuine Poisson fit.
+        var lamHat = parkLambda(data, fits["Poisson (lambda 1)"]);
+        var sel = "Poisson";
+        if (!isNaN(lamHat)) {
+            if (lamHat < 0.5) sel = "Gaussian";
+            else if (lamHat < 1.5) sel = "Poisson";
+            else sel = "Gamma";
+        }
+
+        var nBearing = N - nZeroTariff;
+        var bearingTxt = nBearing + " of " + N + " dyads carry a nonzero tariff";
+        var idWarn = nBearing <= 6
+            ? " <span style='color:#c8102e'><strong>The slope now rests on very few tariff-bearing pairs; the estimates are weakly identified and swing.</strong></span>"
+            : "";
+
+        readout.innerHTML =
+            "<strong>Modified Park lambda (from the real Poisson fit):</strong> "
+            + (isNaN(lamHat) ? "n/a" : lamHat.toFixed(2))
+            + " &rarr; data-preferred family: <strong style='color:#c8102e'>" + sel + "</strong>.<br>"
+            + "<strong>Tariff-bearing dyads:</strong> " + bearingTxt + "." + idWarn
+            + (nDropped > 0 ? " <strong>Gamma dropped " + nDropped + " non-positive draw(s)</strong> as outside its support." : "")
+            + "<br>All three lines are genuine IRLS fits. When lambda is near 1 they nearly coincide; as the variance power or the zero-tariff share rises, they separate and drift.";
+    }
+
+    function redraw() {
+        var lam = parseFloat(slider.value);
+        var z = parseFloat(zeroSlider.value);
+        lamLabel.textContent = lam.toFixed(2);
+        zeroLabel.innerHTML = Math.round(z * 100) + "&#37;";
+        draw(lam, z);
+    }
+    slider.addEventListener("input", redraw);
+    zeroSlider.addEventListener("input", redraw);
+    redraw();
+})();
+</script>
+</body>
+</html>
